@@ -1,81 +1,249 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title></title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>K2 Camera Snapshot</title>
   <style>
-    body {
-      background-color: #1e1e20;
-      margin: 0;
-      height: 100%;
+    html, body {
       width: 100%;
+      height: 100%;
+      margin: 0;
       overflow: hidden;
+      background: #1e1e20;
     }
-
     canvas {
       position: absolute;
-      z-index: -1;
-      top: 0;
-      left: 0;
+      inset: 0;
       width: 100%;
       height: 100%;
-      object-fit: fill;
+      object-fit: fill; /* Original snapshot.html behavior. */
     }
+    video {
+      position: absolute;
+      width: 2px;
+      height: 2px;
+      opacity: 0.01; /* Keep video composited for requestVideoFrameCallback. */
+      pointer-events: none;
+    }
+    #status {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      box-sizing: border-box;
+      color: #cbd5e1;
+      font: 14px/1.5 system-ui, sans-serif;
+      text-align: center;
+      pointer-events: none;
+    }
+    #debug {
+      position: absolute;
+      left: 8px;
+      bottom: 8px;
+      max-height: 50%;
+      max-width: calc(100% - 16px);
+      overflow: auto;
+      margin: 0;
+      padding: 8px;
+      border-radius: 6px;
+      background: rgb(0 0 0 / 75%);
+      color: #c6e6df;
+      font: 11px/1.4 Consolas, Monaco, monospace;
+      white-space: pre-wrap;
+    }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
-  <canvas id='canvas'></canvas>
+  <canvas id="snapshot" aria-label="Camera snapshot"></canvas>
+  <video id="source" autoplay muted playsinline></video>
+  <div id="status">Connecting to camera...</div>
+  <pre id="debug" hidden></pre>
+
   <script>
-    if (navigator.userAgent.toLowerCase().indexOf("android") > -1) {
-      var pc = new RTCPeerConnection();
-    }
-    else {
-      var pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-      });
-    };
-    var log = msg => { console.log(msg); };
-    function sendOfferToCall(sdp) {
-      var xhttp = new XMLHttpRequest();
-      xhttp.onreadystatechange = function () {
-        if (this.readyState == 4 && this.status == 200) {
-          let res = JSON.parse(atob(this.responseText));
-          console.log(res);
-          if (res.type == 'answer') {
-            pc.setRemoteDescription(new RTCSessionDescription(res));
-          }
-        }
-      };
-      xhttp.open('POST', 'http://' + window.location.host.split(':')[0] + ':8000/call/webrtc_local');
-      xhttp.setRequestHeader('Content-Type', 'plain/text');
-      xhttp.send(btoa(JSON.stringify({ 'type': 'offer', 'sdp': sdp })));
-    }
-    pc.ontrack = function (event) {
-      if (window.MediaStreamTrackProcessor) {
-        var processor = new MediaStreamTrackProcessor(event);
-        var reader = processor.readable.getReader();
-        readChunk();
-        function readChunk() {
-          reader.read().then(async ({ done, value }) => {
-            if (value) {
-              var bitmap = await createImageBitmap(value);
-              var canvas = document.querySelector("canvas");
-              var context = canvas.getContext("2d");
-              canvas.width = bitmap.width;
-              canvas.height = bitmap.height;
-              context.drawImage(bitmap, 0, 0);
-              value.close();
-              pc.close();
-            }
-          });
+    // Creality K2 camera snapshot: capture ONE frame, then close WebRTC.
+    // Sends the SDP offer as soon as a STUN (srflx/relay) candidate is ready,
+    // instead of waiting for all ICE gathering to finish (the old ~40s delay).
+    // URL options: ?debug=1, ?fit=contain|cover|fill, ?host=YOUR_PRINTER_IP
+    "use strict";
+    (() => {
+      const params = new URLSearchParams(location.search);
+      const host = params.get("host") || location.hostname;
+      const signalUrl = "http://" + host + ":8000/call/webrtc_local";
+      const stunServers = [
+        "stun:stun.l.google.com:19302",
+        "stun:stun.cloudflare.com:3478"
+      ];
+      const canvas = document.getElementById("snapshot");
+      const video = document.getElementById("source");
+      const status = document.getElementById("status");
+      const debug = document.getElementById("debug");
+      const fit = params.get("fit");
+      if (["fill", "contain", "cover"].includes(fit)) canvas.style.objectFit = fit;
+      debug.hidden = !params.has("debug");
+
+      const startedAt = performance.now();
+      let pc = null;
+      let run = 0;
+      let completed = false;
+      let frameTimeout = null;
+      let fallbackTimer = null;
+
+      function log(message) {
+        const line = "[" + ((performance.now() - startedAt) / 1000).toFixed(2) + " s] " + message;
+        console.info("[K2 Snapshot]", line);
+        if (!debug.hidden) {
+          debug.textContent = (debug.textContent + line + "\n").split("\n").slice(-50).join("\n");
+          debug.scrollTop = debug.scrollHeight;
         }
       }
-    };
-    pc.oniceconnectionstatechange = e => log(pc.iceConnectionState);
-    pc.onicecandidate = event => {
-      if (event.candidate === null) sendOfferToCall(pc.localDescription.sdp)
-    };
-    pc.addTransceiver('video', { 'direction': 'sendrecv' })
-    pc.createOffer().then(d => pc.setLocalDescription(d)).catch(log); 
+
+      function showStatus(message) {
+        status.textContent = message;
+        status.hidden = !message;
+      }
+
+      function stopConnection() {
+        clearTimeout(frameTimeout);
+        frameTimeout = null;
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+        if (pc) {
+          pc.ontrack = pc.onconnectionstatechange = pc.onicecandidate = null;
+          try { pc.close(); } catch (_) { /* already closed */ }
+          pc = null;
+        }
+        if (video.srcObject) {
+          for (const track of video.srcObject.getTracks()) track.stop();
+          video.srcObject = null;
+        }
+        video.pause();
+      }
+
+      function hasPublicCandidate(sdp) {
+        return /a=candidate:[^\r\n]*\btyp (?:srflx|relay)\b/.test(sdp || "");
+      }
+
+      async function waitForOffer(conn, fast) {
+        const deadline = performance.now() + (fast ? 6000 : 45000);
+        while (performance.now() < deadline) {
+          if (fast && hasPublicCandidate(conn.localDescription?.sdp)) return "STUN candidate";
+          if (conn.iceGatheringState === "complete") return "ICE complete";
+          await new Promise(resolve => setTimeout(resolve, 40));
+        }
+        return "ICE timeout";
+      }
+
+      function decodeAnswer(body) {
+        const text = body.trim();
+        try { return JSON.parse(atob(text)); }
+        catch (_) { return JSON.parse(text); }
+      }
+
+      function captureFrame(attempt) {
+        if (completed || attempt !== run || !video.videoWidth || !video.videoHeight) return false;
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        canvas.width = width;
+        canvas.height = height;
+        try {
+          canvas.getContext("2d", { alpha: false }).drawImage(video, 0, 0, width, height);
+        } catch (error) {
+          log("Frame draw failed: " + error.message);
+          return false;
+        }
+        completed = true;
+        showStatus("");
+        log("Snapshot captured (" + width + "x" + height + ")");
+        // The canvas keeps its pixels; no continuous video connection is needed.
+        stopConnection();
+        return true;
+      }
+
+      function listenForFrame(conn, attempt) {
+        conn.ontrack = event => {
+          if (attempt !== run || completed || event.track.kind !== "video") return;
+          log("Video track received");
+          video.srcObject = event.streams[0] || new MediaStream([event.track]);
+          if ("requestVideoFrameCallback" in video) {
+            const onFrame = () => {
+              if (attempt !== run || completed) return;
+              if (!captureFrame(attempt)) video.requestVideoFrameCallback(onFrame);
+            };
+            video.requestVideoFrameCallback(onFrame);
+          } else {
+            const checkFrame = () => {
+              if (attempt !== run || completed) return;
+              if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && captureFrame(attempt)) return;
+              requestAnimationFrame(checkFrame);
+            };
+            video.addEventListener("loadeddata", checkFrame, { once: true });
+          }
+          video.play().catch(error => log("Playback: " + error.message));
+        };
+      }
+
+      async function start(fast = true) {
+        if (completed) return;
+        const attempt = ++run;
+        stopConnection();
+        showStatus("Connecting to camera...");
+        const conn = new RTCPeerConnection({ iceServers: [{ urls: stunServers }] });
+        pc = conn;
+        const mode = fast ? "fast" : "compatibility";
+        log("Starting " + mode + " mode");
+        listenForFrame(conn, attempt);
+        conn.onicecandidate = e => {
+          if (e.candidate) log("ICE candidate: " + (e.candidate.type || "unknown"));
+        };
+        conn.onconnectionstatechange = () => log("Connection: " + conn.connectionState);
+
+        try {
+          conn.addTransceiver("video", { direction: "sendrecv" });
+          await conn.setLocalDescription(await conn.createOffer());
+          const reason = await waitForOffer(conn, fast);
+          if (attempt !== run || completed) return;
+          log("Sending offer (" + reason + ", STUN=" + hasPublicCandidate(conn.localDescription?.sdp) + ")");
+          const response = await fetch(signalUrl, {
+            method: "POST",
+            headers: { "Content-Type": "plain/text" },
+            body: btoa(JSON.stringify({ type: "offer", sdp: conn.localDescription.sdp })),
+            cache: "no-store"
+          });
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          const answer = decodeAnswer(await response.text());
+          if (answer.type !== "answer" || !answer.sdp) throw new Error("Invalid SDP answer");
+          if (attempt !== run || completed) return;
+          await conn.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+          log("SDP answer received");
+          if (completed) return;
+          frameTimeout = setTimeout(() => fail("No video frame received", attempt, fast), 12000);
+        } catch (error) {
+          fail(error.message || "Connection error", attempt, fast);
+        }
+      }
+
+      function fail(message, attempt, fast) {
+        if (attempt !== run || completed) return;
+        log("Attempt failed: " + message);
+        stopConnection();
+        if (fast) {
+          showStatus("Retrying camera connection...");
+          fallbackTimer = setTimeout(() => start(false), 400);
+        } else {
+          showStatus("Could not capture snapshot. Reload this page to retry.");
+        }
+      }
+
+      window.addEventListener("pagehide", () => {
+        run++;
+        stopConnection();
+      });
+      start(true);
+    })();
   </script>
 </body>
 </html>
