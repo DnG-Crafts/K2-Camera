@@ -1,67 +1,264 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title></title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>K2 Camera</title>
   <style>
-    body {
-      background-color: #1e1e20;
+    html, body {
       margin: 0;
-      height: 100%;
       width: 100%;
+      height: 100%;
       overflow: hidden;
+      background: #1e1e20;
     }
 
     video {
       position: absolute;
-      z-index: -1;
-      top: 0;
-      left: 0;
+      inset: 0;
       width: 100%;
       height: 100%;
-      object-fit: fill;
+      object-fit: contain;   /* ?fit=cover or ?fit=fill to change */
+      background: #1e1e20;
+    }
+
+    #status {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      color: #9aa3ad;
+      font: 14px/1.4 system-ui, sans-serif;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    #log {
+      position: absolute;
+      left: 8px;
+      bottom: 8px;
+      max-width: calc(100% - 16px);
+      max-height: 45%;
+      overflow: auto;
+      margin: 0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(0, 0, 0, .7);
+      color: #c6e6df;
+      font: 11px/1.5 Consolas, Monaco, monospace;
+      white-space: pre-wrap;
     }
   </style>
 </head>
 <body>
-  <video id='remoteVideos'></video>
+  <video id="video" autoplay muted playsinline disablepictureinpicture></video>
+  <div id="status">Connecting to camera...</div>
+  <pre id="log" hidden></pre>
+
   <script>
-    if (navigator.userAgent.toLowerCase().indexOf("android") > -1) {
-      var pc = new RTCPeerConnection();
-    }
-    else {
-      var pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-      });
-    };
-    var log = msg => { console.log(msg); };
-    function sendOfferToCall(sdp) {
-      var xhttp = new XMLHttpRequest();
-      xhttp.onreadystatechange = function () {
-        if (this.readyState == 4 && this.status == 200) {
-          let res = JSON.parse(atob(this.responseText));
-          console.log(res);
-          if (res.type == 'answer') {
-            pc.setRemoteDescription(new RTCSessionDescription(res));
-          }
+    // K2 camera over WebRTC, signalled through Creality's service on port 8000.
+    //
+    // The original page waited for ICE gathering to finish before sending its offer.
+    // In our tests that delayed signaling by about 40 seconds. Some browsers
+    // advertise local host candidates as mDNS .local names, which the printer
+    // might not resolve; without STUN, our test did not produce video. This page
+    // sends the offer as soon as a server-reflexive (srflx) candidate is ready.
+    //
+    // On top of that: automatic reconnect (errors, no picture, frozen picture),
+    // a fallback attempt that waits for full gathering, and the stream is closed
+    // while the tab is hidden.
+    //
+    // URL parameters (all optional):
+    //   ?host=YOUR_PRINTER_IP          printer address when the page is opened elsewhere
+    //   ?fit=contain|cover|fill       how the picture fills the window
+    //   ?stun=stun:host:port,...      other STUN servers, or ?stun=off
+    //   ?debug=1                      show a connection log
+    "use strict";
+    (() => {
+      const params = new URLSearchParams(location.search);
+      const HOST = params.get("host") || location.hostname;
+      const SIGNAL_URL = "http://" + HOST + ":8000/call/webrtc_local";
+      // STUN on every platform: without it the browser only offers hidden .local addresses.
+      const STUN = params.get("stun") === "off" ? [] :
+        (params.get("stun") ? params.get("stun").split(",") :
+          ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"]);
+
+      const FAST_WAIT_MS = 5000;        // fast mode: longest wait for a srflx candidate
+      const FULL_WAIT_MS = 20000;       // fallback mode: longest wait for complete gathering
+      const NO_VIDEO_MS = 12000;        // answer received but no picture: try again
+      const STALL_MS = 10000;           // picture frozen this long: reconnect
+      const MAX_RETRY_MS = 8000;
+
+      const video = document.getElementById("video");
+      const statusEl = document.getElementById("status");
+      const logEl = document.getElementById("log");
+      if (["contain", "cover", "fill"].includes(params.get("fit"))) video.style.objectFit = params.get("fit");
+      logEl.hidden = !params.has("debug");
+
+      let pc = null;
+      let session = 0;
+      let noVideo = 0;                  // answered but no picture: counts toward the slow mode
+      let retryDelay = 1000;
+      let retryTimer = null;
+      let watchdog = null;
+      let playing = false;
+      const t0 = performance.now();
+
+      function log(text) {
+        const line = "[" + ((performance.now() - t0) / 1000).toFixed(2) + " s] " + text;
+        console.info("[K2 Camera]", line);
+        if (!logEl.hidden) {
+          logEl.textContent = (logEl.textContent + line + "\n").split("\n").slice(-60).join("\n");
+          logEl.scrollTop = logEl.scrollHeight;
         }
-      };
-      xhttp.open('POST', 'http://' + window.location.host.split(':')[0] + ':8000/call/webrtc_local');
-      xhttp.setRequestHeader('Content-Type', 'plain/text');
-      xhttp.send(btoa(JSON.stringify({ 'type': 'offer', 'sdp': sdp })));
-    }
-    pc.ontrack = function (event) {
-      var el = document.getElementById('remoteVideos');
-      el.srcObject = event.streams[0];
-      el.autoplay = true;
-      el.controls = false;
-      el.muted = true;
-    };
-    pc.oniceconnectionstatechange = e => log(pc.iceConnectionState);
-    pc.onicecandidate = event => {
-      if (event.candidate === null) sendOfferToCall(pc.localDescription.sdp)
-    };
-    pc.addTransceiver('video', { 'direction': 'sendrecv' })
-    pc.createOffer().then(d => pc.setLocalDescription(d)).catch(log); 
+      }
+
+      function showStatus(text) {
+        statusEl.textContent = text || "";
+        statusEl.style.display = text ? "flex" : "none";
+      }
+
+      function closeConnection() {
+        clearInterval(watchdog);
+        watchdog = null;
+        if (pc) {
+          pc.ontrack = pc.onconnectionstatechange = pc.onicecandidate = null;
+          try { pc.close(); } catch (e) { /* already closed */ }
+          pc = null;
+        }
+        video.srcObject = null;
+        playing = false;
+      }
+
+      function retry(reason, countsAsNoVideo = false) {
+        if (document.hidden) { closeConnection(); return; }
+        if (countsAsNoVideo) noVideo += 1;
+        log("Retrying: " + reason);
+        closeConnection();
+        showStatus(reason + " – retrying...");
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
+      }
+
+      const hasReachable = (sdp) => /a=candidate:[^\r\n]*\btyp (?:srflx|relay)\b/.test(sdp || "");
+
+      // Resolve when the offer is worth sending (see the modes in connect()).
+      function offerReady(conn, fast) {
+        const ready = () => conn.iceGatheringState === "complete" ||
+          (fast && hasReachable(conn.localDescription && conn.localDescription.sdp));
+        if (ready()) return Promise.resolve("immediately");
+        return new Promise((resolve) => {
+          const finish = (why) => { clearInterval(poll); clearTimeout(timer); resolve(why); };
+          const poll = setInterval(() => { if (ready()) finish(fast ? "STUN candidate" : "ICE complete"); }, 50);
+          const timer = setTimeout(() => finish("timeout"), fast ? FAST_WAIT_MS : FULL_WAIT_MS);
+        });
+      }
+
+      function decodeAnswer(text) {
+        text = text.trim();
+        try { return JSON.parse(atob(text)); } catch (e) { /* not base64 */ }
+        return JSON.parse(text);
+      }
+
+      async function connect() {
+        clearTimeout(retryTimer);
+        closeConnection();
+        const mySession = ++session;
+        // After two answers without a picture, try once waiting for complete ICE
+        // gathering like the original page. Plain network errors never trigger it.
+        const fast = noVideo % 3 !== 2;
+        const conn = new RTCPeerConnection({ iceServers: STUN.length ? [{ urls: STUN }] : [] });
+        pc = conn;
+        log("Connecting (" + (fast ? "fast" : "waiting for full ICE gathering") + ", STUN: " + (STUN.length ? "on" : "off") + ")");
+        if (!playing) showStatus("Connecting to camera...");
+
+        conn.addTransceiver("video", { direction: "sendrecv" });   // what the printer expects
+        conn.ontrack = (event) => {
+          video.srcObject = event.streams[0] || new MediaStream([event.track]);
+          video.play().catch(() => {});
+        };
+        conn.onicecandidate = (event) => {
+          if (event.candidate && event.candidate.candidate) log("ICE candidate: " + (event.candidate.type || "?"));
+        };
+        conn.onconnectionstatechange = () => {
+          if (mySession !== session) return;
+          log("Connection: " + conn.connectionState);
+          if (conn.connectionState === "failed") retry("Connection failed", true);
+        };
+
+        try {
+          await conn.setLocalDescription(await conn.createOffer());
+          const why = await offerReady(conn, fast);
+          if (mySession !== session) return;
+          log("Sending offer (" + why + ", srflx: " + hasReachable(conn.localDescription.sdp) + ")");
+          const response = await fetch(SIGNAL_URL, {
+            method: "POST",
+            headers: { "Content-Type": "plain/text" },     // same request as Creality's page
+            body: btoa(JSON.stringify({ type: "offer", sdp: conn.localDescription.sdp })),
+            cache: "no-store",
+          });
+          if (!response.ok) throw new Error("camera responded with HTTP " + response.status);
+          const answer = decodeAnswer(await response.text());
+          if (mySession !== session) return;
+          if (answer.type !== "answer" || !answer.sdp) throw new Error("invalid response");
+          await conn.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+          log("Answer received");
+        } catch (err) {
+          if (mySession === session) retry("Cannot reach camera (" + err.message + ")");
+          return;
+        }
+
+        // Watchdog: first a picture must arrive, then it must keep moving.
+        const answeredAt = Date.now();
+        let lastTime = -1;
+        let lastChange = Date.now();
+        watchdog = setInterval(() => {
+          if (mySession !== session) return;
+          if (!playing) {
+            if (Date.now() - answeredAt > NO_VIDEO_MS) retry("No video from camera", true);
+            return;
+          }
+          if (video.currentTime !== lastTime) {
+            lastTime = video.currentTime;
+            lastChange = Date.now();
+          } else if (Date.now() - lastChange > STALL_MS) {
+            retry("Video froze");
+          }
+        }, 1000);
+      }
+
+      video.addEventListener("playing", () => {
+        if (playing) return;
+        playing = true;
+        noVideo = 0;
+        retryDelay = 1000;
+        showStatus("");
+        log("Video playing");
+      });
+
+      // Don't keep a stream running in a background tab.
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          clearTimeout(retryTimer);
+          session++;
+          closeConnection();
+          log("Tab hidden, camera paused");
+        } else {
+          connect();
+        }
+      });
+
+      // Double-click for full screen.
+      document.addEventListener("dblclick", () => {
+        if (document.fullscreenElement) document.exitFullscreen();
+        else document.documentElement.requestFullscreen().catch(() => {});
+      });
+
+      connect();
+    })();
   </script>
 </body>
 </html>
